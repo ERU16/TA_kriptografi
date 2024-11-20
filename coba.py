@@ -1,5 +1,6 @@
 import streamlit as st
 import mysql.connector
+from PIL import Image
 from mysql.connector import Error
 from PyPDF2 import PdfReader, PdfWriter
 import io
@@ -96,6 +97,54 @@ def create_table():
         if connection.is_connected():
             cursor.close()
             connection.close()
+
+def hide_message(image, message):
+    encoded_image = image.copy()
+    binary_message = ''.join([format(ord(i), "08b") for i in message]) + '11111111'
+    pixels = encoded_image.load()
+
+    idx = 0
+    for row in range(image.height):
+        for col in range(image.width):
+            if idx < len(binary_message):
+                r, g, b = pixels[col, row]
+                r = (r & ~1) | int(binary_message[idx])  # Encode bit ke LSB Red
+                pixels[col, row] = (r, g, b)
+                idx += 1
+    return encoded_image
+
+# Fungsi untuk membaca pesan dari gambar
+def reveal_message(image):
+    pixels = image.load()
+    binary_message = ""
+    for row in range(image.height):
+        for col in range(image.width):
+            r, _, _ = pixels[col, row]
+            binary_message += str(r & 1)
+
+            if binary_message[-8:] == "11111111":
+                return ''.join([chr(int(binary_message[i:i+8], 2)) for i in range(0, len(binary_message)-8, 8)])
+    return "Tidak ada pesan tersembunyi."
+
+# Fungsi untuk menyimpan data ke database
+def save_to_db(image):
+    conn = create_connection()
+    cursor = conn.cursor()
+    image_byte_arr = io.BytesIO()
+    image.save(image_byte_arr, format='PNG')
+    image_blob = image_byte_arr.getvalue()
+
+    query = "INSERT INTO stego_image (image) VALUES (%s)"
+    cursor.execute(query, (image_blob,))
+    conn.commit()
+    st.success("Gambar dan pesan berhasil disimpan ke database!")
+
+# Fungsi untuk mengambil gambar dari database
+def fetch_images_from_db():
+    conn = create_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, image FROM stego_image")
+    return cursor.fetchall()
 
 # Fungsi untuk mengunggah PDF ke database
 def upload_pdf(kode_soal, file, encryption_key):
@@ -301,7 +350,7 @@ def dashboard_page():
     st.text("\n\n")
     
 
-    menu = ["Upload PDF", "Daftar & Unduh PDF", "Dekripsi PDF"]
+    menu = ["Upload PDF", "Daftar & Unduh PDF", "Dekripsi PDF", "Steganografi"]
     choice = st.sidebar.selectbox("Menu", menu)
 
     if choice == "Upload PDF":
@@ -340,21 +389,109 @@ def dashboard_page():
 
     elif choice == "Dekripsi PDF":
         st.header("Dekripsi File PDF")
+        menu = st.selectbox("MENU",["Dekripsi PDF yang ada di Database", "Dekripsi PDF dari File Lokal"])
         files = fetch_files()
+        if menu == "Dekripsi PDF yang ada di Database":
+            if files:
+                for file in files:
+                    kode = file['kode_soal']
+                    kode = super_decrypt(kode)
+                    st.write(f"Kode: {kode}")
+                    st.write(f"Nama: {file['file_name']}")
+                    input_key = st.text_input("Masukkan kunci untuk dekripsi", type="password", key=f"decrypt_key_{file['id']}")
 
-        if files:
-            for file in files:
-                kode = file['kode_soal']
-                kode = super_decrypt(kode)
-                st.write(f"Kode: {kode}")
-                st.write(f"Nama: {file['file_name']}")
-                input_key = st.text_input("Masukkan kunci untuk dekripsi", type="password", key=f"decrypt_key_{file['id']}")
+                    if st.button(f"Validasi & Dekripsi (Kode: {kode})"):
+                        decrypt_and_download_file(file['id'], input_key)
+            else:
+                st.info("Tidak ada file yang tersedia.")
+        elif menu == "Dekripsi PDF dari File Lokal":
+            st.subheader("Dekripsi dari Komputer")
+            uploaded_pdf = st.file_uploader("Unggah File PDF Terenkripsi", type=["pdf"])
+            decryption_key = st.text_input("Masukkan kunci dekripsi untuk file lokal", type="password")
 
-                if st.button("Validasi & Dekripsi"):
-                    decrypt_and_download_file(file['id'], input_key)
-        else:
-            st.info("Tidak ada file yang tersedia.")
+            if st.button("Dekripsi File Lokal"):
+                if uploaded_pdf and decryption_key:
+                    try:
+                        pdf_data = uploaded_pdf.read()
+                        decrypted_data = decrypt_pdf(pdf_data, decryption_key)
 
+                        if decrypted_data:
+                            st.success("File berhasil didekripsi!")
+                            st.download_button(
+                                label="Unduh File Dekripsi",
+                                data=decrypted_data,
+                                file_name="decrypted_" + uploaded_pdf.name,
+                                mime="application/pdf"
+                            )
+                        else:
+                            st.error("Gagal mendekripsi file. Pastikan kunci yang dimasukkan benar.")
+                    except Exception as e:
+                        st.error(f"Terjadi kesalahan: {e}")
+                else:
+                    st.warning("Harap unggah file dan masukkan kunci dekripsi.")
+
+    elif choice == "Steganografi":
+
+        menu = st.selectbox("Menu", ["Menyimpan Pesan", "Melihat Pesan"])
+        
+        if menu == "Menyimpan Pesan":
+            st.header("Menyisipkan Pesan ke dalam Gambar")
+            uploaded_image = st.file_uploader("Unggah Gambar", type=["png", "jpg", "jpeg"])
+            message = st.text_area("Pesan yang akan disisipkan")
+            pesan = super_encrypt(message)
+            if uploaded_image and message:
+                image = Image.open(uploaded_image).convert("RGB")
+                encoded_image = hide_message(image, pesan)
+
+                st.image(encoded_image, caption="Gambar dengan pesan tersembunyi")
+
+                if st.button("Simpan ke Database"):
+                    save_to_db(encoded_image)
+
+                image_byte_arr = io.BytesIO()
+                encoded_image.save(image_byte_arr, format="PNG")
+                st.download_button(
+                    label="Download Gambar dengan Pesan",
+                    data=image_byte_arr.getvalue(),
+                    file_name="stego_image.png",
+                    mime="image/png"
+                )
+
+        elif menu == "Melihat Pesan":
+            st.header("Melihat Pesan dari Gambar")
+
+            source_option = st.radio("Pilih Sumber Gambar", ["Unggah Gambar", "Dari Database"])
+
+            if source_option == "Unggah Gambar":
+        
+                uploaded_image = st.file_uploader("Unggah Gambar", type=["png", "jpg", "jpeg"])
+        
+                if uploaded_image:
+                    image = Image.open(uploaded_image).convert("RGB")
+                    st.image(image, caption="Gambar yang diunggah")
+
+                    if st.button("Lihat Pesan"):
+                        message = reveal_message(image)
+                        pesan = super_decrypt(message)
+                        st.write(f"Pesan: {pesan}")
+
+            elif source_option == "Dari Database":
+                images = fetch_images_from_db()
+                if images:
+                    image_options = {f"Gambar {img[0]}": img for img in images}
+                    selected_image = st.selectbox("Pilih Gambar", list(image_options.keys()))
+
+                    if selected_image:
+                        image_id, image_blob = image_options[selected_image]
+                        image = Image.open(io.BytesIO(image_blob))
+                        st.image(image, caption=f"Gambar {image_id}")
+
+                        if st.button("Lihat Pesan"):
+                            message = reveal_message(image)
+                            pesan = super_decrypt(message)
+                            st.write(f"Pesan: {pesan}")
+                else:
+                    st.write("Tidak ada gambar dalam database.")
 def main():
     if "logged_in" not in st.session_state:
         st.session_state["logged_in"] = False
